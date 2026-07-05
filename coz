@@ -143,6 +143,9 @@ def _coz_run(args):
   if args.auto_scope:
     env['COZ_AUTO_SCOPE'] = '1'
 
+  if args.filter_system:
+    env['COZ_FILTER_SYSTEM'] = '1'
+
   env['COZ_PROGRESS_POINTS'] = '\t'.join(args.progress)
 
   env['COZ_OUTPUT'] = args.output
@@ -2310,6 +2313,12 @@ _run_parser.add_argument('--auto-scope',
                               'dlmopen()s later, even if it does not match --binary-scope. '
                               'Lets dynamically loaded plugins get profiled with no scope '
                               'configuration at all.')
+
+_run_parser.add_argument('--filter-system',
+                         action='store_true', default=False,
+                         help='Drop source lines under system paths (/usr/include, /usr/lib, '
+                              '/lib, etc.) after the DWARF pass, so standard-library headers '
+                              'never become candidate lines or show up in samples.')
 
 _run_parser.add_argument('--progress', '-p',
                          metavar='<source file>:<line number>',
