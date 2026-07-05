@@ -191,7 +191,7 @@ void init_coz(void) {
   initialized = false;
 
   // Remove Coz from LD_PRELOAD. Just clearing LD_PRELOAD for now FIXME!
-  unsetenv("LD_PRELOAD");
+  // unsetenv("LD_PRELOAD");
 
   // Read settings out of environment variables
   string output_file = getenv_safe("COZ_OUTPUT", "profile.coz");
