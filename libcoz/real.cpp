@@ -57,7 +57,18 @@ static void* get_pthread_handle() {
   return libsystem_handle ? libsystem_handle : RTLD_DEFAULT;
 #else
   if(pthread_handle == NULL && !__atomic_exchange_n(&in_dlopen, true, __ATOMIC_ACQ_REL)) {
-    pthread_handle = dlopen("libpthread.so.0", RTLD_NOW | RTLD_GLOBAL);
+    // Resolve the real dlopen directly via RTLD_NEXT rather than calling the
+    // bare `dlopen` symbol. This function runs while evaluating an argument
+    // inside another symbol's GET_SYMBOL_HANDLE (e.g. pthread_mutex_lock),
+    // which already holds the shared `resolving` flag. Once libcoz interposes
+    // dlopen() (to rescan memory_map for newly loaded libraries), calling the
+    // bare symbol here would self-interpose into that wrapper -> real::dlopen
+    // -> its own first-time GET_SYMBOL resolution -> which spins forever on
+    // the same non-reentrant `resolving` flag this call is nested under.
+    typedef void* (*dlopen_fn_t)(const char*, int);
+    dlopen_fn_t real_dlopen_fn = reinterpret_cast<dlopen_fn_t>(dlsym(RTLD_NEXT, "dlopen"));
+    REQUIRE(real_dlopen_fn != nullptr) << dlerror();
+    pthread_handle = real_dlopen_fn("libpthread.so.0", RTLD_NOW | RTLD_GLOBAL);
     REQUIRE(pthread_handle != NULL) << dlerror();
     __atomic_store_n(&in_dlopen, false, __ATOMIC_RELEASE);
   }
@@ -97,6 +108,20 @@ static int resolve_fork() throw() {
   if(real_fork) return real_fork();
   else return -1;
 }
+
+#ifndef __APPLE__
+static void* resolve_dlopen(const char* filename, int flags) throw() {
+  GET_SYMBOL(dlopen);
+  if(real_dlopen) return real_dlopen(filename, flags);
+  else return nullptr;
+}
+
+static void* resolve_dlmopen(Lmid_t nsid, const char* filename, int flags) throw() {
+  GET_SYMBOL(dlmopen);
+  if(real_dlmopen) return real_dlmopen(nsid, filename, flags);
+  else return nullptr;
+}
+#endif
 
 static int resolve_sigaction(int signum, const struct sigaction* act, struct sigaction* old_act) throw() {
   GET_SYMBOL(sigaction);
@@ -304,6 +329,11 @@ namespace real {
   DEFINE_WRAPPER(_exit);
   DEFINE_WRAPPER(_Exit);
   DEFINE_WRAPPER(fork);
+
+#ifndef __APPLE__
+  DEFINE_WRAPPER(dlopen);
+  DEFINE_WRAPPER(dlmopen);
+#endif
 
   DEFINE_WRAPPER(sigaction);
   DEFINE_WRAPPER(signal);

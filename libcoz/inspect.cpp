@@ -354,29 +354,65 @@ static const subprogram_range* find_subprogram(const vector<subprogram_range>& r
   return nullptr;
 }
 
-void memory_map::build(const unordered_set<string>& binary_scope,
-                       const unordered_set<string>& source_scope,
-                       bool allow_system_sources) {
+size_t memory_map::scan_new_binaries() {
   auto loaded = get_loaded_files();
 
   size_t in_scope_count = 0;
   for(const auto& f : loaded) {
-    if(in_scope(f.first, binary_scope)) {
-      try {
-        if(process_file(f.first, f.second, source_scope, allow_system_sources)) {
-          VERBOSE << "Including lines from executable " << f.first;
-          in_scope_count++;
-        } else {
-          VERBOSE << "Unable to locate debug information for " << f.first;
-        }
-      } catch(const system_error& e) {
-        WARNING << "Processing file \"" << f.first << "\" failed: " << e.what();
+    const string& path = f.first;
+    if(_processed_binaries.count(path) > 0) continue;
+    if(!in_scope(path, _binary_scope)) continue;
+
+    // Mark as attempted before processing so a later rescan() never retries
+    // a binary that failed or had no debug info, matching build()'s existing
+    // one-shot-per-binary semantics.
+    _processed_binaries.insert(path);
+
+    try {
+      if(process_file(path, f.second, _source_scope, _allow_system_sources)) {
+        VERBOSE << "Including lines from executable " << path;
+        in_scope_count++;
+      } else {
+        VERBOSE << "Unable to locate debug information for " << path;
       }
+    } catch(const system_error& e) {
+      WARNING << "Processing file \"" << path << "\" failed: " << e.what();
     }
   }
+  return in_scope_count;
+}
 
-  REQUIRE(in_scope_count > 0)
-    << "Debug information was not found for any in-scope executables or libraries";
+void memory_map::build(const unordered_set<string>& binary_scope,
+                       const unordered_set<string>& source_scope,
+                       bool allow_system_sources) {
+  _binary_scope = binary_scope;
+  _source_scope = source_scope;
+  _allow_system_sources = allow_system_sources;
+
+  size_t in_scope_count = scan_new_binaries();
+
+  // This used to be a fatal REQUIRE, but zero in-scope binaries at bootstrap
+  // is now an expected state: a scope pattern may only match libraries that
+  // are dlopen'd later (that's the whole point of the incremental rescan
+  // path), so failing to find anything yet must not abort the process.
+  if(in_scope_count == 0) {
+    WARNING << "Debug information was not found for any in-scope executables "
+            << "or libraries yet; will rescan as libraries are dlopen'd";
+  }
+}
+
+void memory_map::rescan() {
+  _lock.lock();
+  size_t newly_processed = scan_new_binaries();
+  _lock.unlock();
+
+  if(newly_processed > 0) {
+    VERBOSE << "Rescan added debug info for " << newly_processed
+            << " newly-loaded binaries";
+  }
+  // No REQUIRE here: finding zero newly-in-scope binaries is the common,
+  // expected case (e.g. a dlopen'd library that doesn't match binary_scope)
+  // and must not abort the process.
 }
 
 dwarf::value find_attribute(const dwarf::die& d, dwarf::DW_AT attr) {

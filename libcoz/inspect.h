@@ -20,10 +20,16 @@
 #include <utility>
 #include <vector>
 
+#include "ccutil/spinlock.h"
+
 namespace dwarf {
   class die;
   class line_table;
 }
+
+/// Check whether a (canonicalized) binary path matches a set of scope patterns.
+/// Shared by the initial build() scan and incremental rescan().
+bool in_scope(const std::string& name, const std::unordered_set<std::string>& scope);
 
 class file;
 class interval;
@@ -147,12 +153,23 @@ public:
   void build(const std::unordered_set<std::string>& binary_scope,
              const std::unordered_set<std::string>& source_scope,
              bool allow_system_sources);
-  
+
+  /// Incrementally scan for binaries loaded since the last build()/rescan() call
+  /// (e.g. via dlopen/dlmopen) and merge in any newly in-scope debug info.
+  /// Purely additive: never removes or replaces existing entries, so raw
+  /// pointers obtained from find_line() remain valid across a rescan.
+  void rescan();
+
+  /// Spinlock guarding _files/_ranges/_processed_binaries. Exposed so callers
+  /// can choose blocking lock() or non-blocking trylock() based on their own
+  /// context (e.g. signal handlers must never block).
+  inline spinlock& get_lock() { return _lock; }
+
   std::shared_ptr<line> find_line(const std::string& name);
   std::shared_ptr<line> find_line(uintptr_t addr);
-  
+
   static memory_map& get_instance();
-  
+
 private:
   memory_map() : _files(std::map<std::string, std::shared_ptr<file>>()),
                  _ranges(std::map<interval, std::shared_ptr<line>>()) {}
@@ -171,7 +188,12 @@ private:
   }
   
   void add_range(std::string filename, size_t line_no, interval range);
-  
+
+  /// Walk currently loaded binaries, process any not yet in _processed_binaries
+  /// that match _binary_scope, and return the number of newly in-scope binaries
+  /// processed. Shared by build() (first full scan) and rescan() (incremental).
+  size_t scan_new_binaries();
+
   /// Find a debug version of provided file and add all of its in-scope lines to the map
   bool process_file(const std::string& name, uintptr_t load_address,
                     const std::unordered_set<std::string>& source_scope,
@@ -190,6 +212,12 @@ private:
   
   std::map<std::string, std::shared_ptr<file>> _files;
   std::map<interval, std::shared_ptr<line>> _ranges;
+
+  std::unordered_set<std::string> _binary_scope;
+  std::unordered_set<std::string> _source_scope;
+  bool _allow_system_sources = false;
+  std::unordered_set<std::string> _processed_binaries;
+  spinlock _lock;
 };
 
 static std::ostream& operator<<(std::ostream& os, const interval& i) {

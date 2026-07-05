@@ -480,7 +480,9 @@ void profiler::log_samples(ofstream& output, size_t start_time) {
   }
 
   // Log sample counts for all observed lines
-  for(const auto& file_entry : memory_map::get_instance().files()) {
+  memory_map& mm = memory_map::get_instance();
+  mm.get_lock().lock();
+  for(const auto& file_entry : mm.files()) {
     for(const auto& line_entry : file_entry.second->lines()) {
       shared_ptr<line> l = line_entry.second;
       if(l->get_samples() > 0) {
@@ -495,6 +497,7 @@ void profiler::log_samples(ofstream& output, size_t start_time) {
       }
     }
   }
+  mm.get_lock().unlock();
 }
 
 /**
@@ -614,38 +617,48 @@ void profiler::end_sampling() {
 std::pair<line*,bool> profiler::match_line(perf_event::record& sample) {
   // bool -> true: hit selected_line
   std::pair<line*, bool> match_res(nullptr, false);
-  // flag use to increase the sample only for the first line in the source scope. could it be last line in callchain?
-  bool first_hit = false;
   if(!sample.is_sample())
     return match_res;
+
+  memory_map& mm = memory_map::get_instance();
+  // This may run from a signal handler, so never block: if a dlopen-triggered
+  // rescan currently holds the lock (possibly on this very thread), just skip
+  // attribution for this one sample rather than risk a self-deadlock on the
+  // non-reentrant spinlock.
+  if(!mm.get_lock().trylock())
+    return match_res;
+
+  // flag use to increase the sample only for the first line in the source scope. could it be last line in callchain?
+  bool first_hit = false;
   // Check if the sample occurred in known code
-  line* l = memory_map::get_instance().find_line(sample.get_ip()).get();
+  line* l = mm.find_line(sample.get_ip()).get();
   if(l){
     match_res.first = l;
     first_hit = true;
     if(_selected_line == l){
       match_res.second = true;
-      return match_res;
     }
   }
   // Walk the callchain
-  for(uint64_t pc : sample.get_callchain()) {
-    // Need to subtract one. PC is the return address, but we're looking for the callsite.
-    l = memory_map::get_instance().find_line(pc-1).get();
-    if(l){
-      if(!first_hit){
-        first_hit = true;
-        match_res.first = l;
-      }
-      if(_selected_line == l){
-        match_res.first = l;
-	match_res.second = true;
-        return match_res;
+  if(!match_res.second) {
+    for(uint64_t pc : sample.get_callchain()) {
+      // Need to subtract one. PC is the return address, but we're looking for the callsite.
+      l = mm.find_line(pc-1).get();
+      if(l){
+        if(!first_hit){
+          first_hit = true;
+          match_res.first = l;
+        }
+        if(_selected_line == l){
+          match_res.first = l;
+          match_res.second = true;
+          break;
+        }
       }
     }
   }
 
-  // No hits. Return null
+  mm.get_lock().unlock();
   return match_res;
 }
 

@@ -8,6 +8,11 @@
 #if !defined(CAUSAL_RUNTIME_REAL_H)
 #define CAUSAL_RUNTIME_REAL_H
 
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+#endif
+
+#include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -20,7 +25,12 @@ namespace real {
   DECLARE_WRAPPER(_exit);
   DECLARE_WRAPPER(_Exit);
   DECLARE_WRAPPER(fork);
-  
+
+#ifndef __APPLE__
+  DECLARE_WRAPPER(dlopen);
+  DECLARE_WRAPPER(dlmopen);
+#endif
+
   DECLARE_WRAPPER(sigaction);
   DECLARE_WRAPPER(signal);
   DECLARE_WRAPPER(kill);

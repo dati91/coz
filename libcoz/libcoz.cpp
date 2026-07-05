@@ -5,6 +5,10 @@
  * directory of this distribution and at http://github.com/plasma-umass/coz.
  */
 
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+#endif
+
 #include <dlfcn.h>
 #ifdef __APPLE__
   #include <limits.h>
@@ -680,6 +684,25 @@ extern "C" {
     int rc = sigwait(set, &sig);
     real::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     return rc;
+  }
+
+  /// Forward to the real dlopen(), then rescan for newly in-scope binaries
+  /// so libraries loaded after startup are picked up for line attribution.
+  void* dlopen(const char* filename, int flags) {
+    void* result = real::dlopen(filename, flags);
+    if(initialized && result != nullptr) {
+      memory_map::get_instance().rescan();
+    }
+    return result;
+  }
+
+  /// Same as dlopen(), for the link-map-namespace-aware GNU variant.
+  void* dlmopen(Lmid_t nsid, const char* filename, int flags) {
+    void* result = real::dlmopen(nsid, filename, flags);
+    if(initialized && result != nullptr) {
+      memory_map::get_instance().rescan();
+    }
+    return result;
   }
 #endif // !__APPLE__
 }
