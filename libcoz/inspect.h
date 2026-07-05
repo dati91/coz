@@ -150,15 +150,27 @@ public:
   
   /// Build a map from addresses to source lines by examining binaries that match the provided
   /// scope patterns, adding only source files matching the source scope patterns.
+  /// If auto_scope is set, any binary later passed to rescan() as a
+  /// force_include_path is scanned regardless of whether it matches
+  /// binary_scope (see rescan()).
   void build(const std::unordered_set<std::string>& binary_scope,
              const std::unordered_set<std::string>& source_scope,
-             bool allow_system_sources);
+             bool allow_system_sources,
+             bool auto_scope);
 
   /// Incrementally scan for binaries loaded since the last build()/rescan() call
   /// (e.g. via dlopen/dlmopen) and merge in any newly in-scope debug info.
   /// Purely additive: never removes or replaces existing entries, so raw
   /// pointers obtained from find_line() remain valid across a rescan.
-  void rescan();
+  ///
+  /// If auto_scope was enabled in build() and force_include_path is
+  /// non-empty, that specific binary is scanned regardless of binary_scope -
+  /// this is what lets a dlopen()'d library that was never named in
+  /// --binary-scope get profiled automatically, since the caller explicitly
+  /// asked to load it. Everything else newly mapped in this same snapshot
+  /// (e.g. transitive dependencies pulled in alongside it) still goes
+  /// through the normal binary_scope match.
+  void rescan(const std::string& force_include_path = std::string());
 
   /// Spinlock guarding _files/_ranges/_processed_binaries. Exposed so callers
   /// can choose blocking lock() or non-blocking trylock() based on their own
@@ -190,9 +202,10 @@ private:
   void add_range(std::string filename, size_t line_no, interval range);
 
   /// Walk currently loaded binaries, process any not yet in _processed_binaries
-  /// that match _binary_scope, and return the number of newly in-scope binaries
+  /// that match _binary_scope (or exactly match force_include_path when
+  /// _auto_scope is set), and return the number of newly in-scope binaries
   /// processed. Shared by build() (first full scan) and rescan() (incremental).
-  size_t scan_new_binaries();
+  size_t scan_new_binaries(const std::string& force_include_path = std::string());
 
   /// Find a debug version of provided file and add all of its in-scope lines to the map
   bool process_file(const std::string& name, uintptr_t load_address,
@@ -216,6 +229,7 @@ private:
   std::unordered_set<std::string> _binary_scope;
   std::unordered_set<std::string> _source_scope;
   bool _allow_system_sources = false;
+  bool _auto_scope = false;
   std::unordered_set<std::string> _processed_binaries;
   spinlock _lock;
 };

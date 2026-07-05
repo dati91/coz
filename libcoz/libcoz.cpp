@@ -15,6 +15,7 @@
   #include <mach-o/dyld.h>
 #else
   #include <linux/limits.h>
+  #include <link.h>
 #endif
 #include <pthread.h>
 #include <stdlib.h>
@@ -239,8 +240,9 @@ void init_coz(void) {
 
   // Build the memory map for all in-scope binaries
   bool filter_system_sources = getenv("COZ_FILTER_SYSTEM");
+  bool auto_scope = getenv("COZ_AUTO_SCOPE");
 
-  memory_map::get_instance().build(binary_scope, source_scope, !filter_system_sources);
+  memory_map::get_instance().build(binary_scope, source_scope, !filter_system_sources, auto_scope);
 
   // Register any sampling progress points
   for(const string& line_name : progress_points) {
@@ -686,12 +688,26 @@ extern "C" {
     return rc;
   }
 
+  /// Resolve the path the dynamic linker actually mapped for `handle`, so
+  /// auto_scope can force-include exactly what the caller asked to load
+  /// (not just whatever string they happened to pass to dlopen(), which may
+  /// be a bare soname or a relative path resolved via the linker's search
+  /// path rather than the canonical path get_loaded_files() reports).
+  static string resolved_dlopen_path(void* handle) {
+    struct link_map* lm = nullptr;
+    if(handle != nullptr && dlinfo(handle, RTLD_DI_LINKMAP, &lm) == 0 &&
+       lm != nullptr && lm->l_name != nullptr) {
+      return string(lm->l_name);
+    }
+    return string();
+  }
+
   /// Forward to the real dlopen(), then rescan for newly in-scope binaries
   /// so libraries loaded after startup are picked up for line attribution.
   void* dlopen(const char* filename, int flags) {
     void* result = real::dlopen(filename, flags);
     if(initialized && result != nullptr) {
-      memory_map::get_instance().rescan();
+      memory_map::get_instance().rescan(resolved_dlopen_path(result));
     }
     return result;
   }
@@ -700,7 +716,7 @@ extern "C" {
   void* dlmopen(Lmid_t nsid, const char* filename, int flags) {
     void* result = real::dlmopen(nsid, filename, flags);
     if(initialized && result != nullptr) {
-      memory_map::get_instance().rescan();
+      memory_map::get_instance().rescan(resolved_dlopen_path(result));
     }
     return result;
   }

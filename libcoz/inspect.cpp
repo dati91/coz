@@ -354,14 +354,27 @@ static const subprogram_range* find_subprogram(const vector<subprogram_range>& r
   return nullptr;
 }
 
-size_t memory_map::scan_new_binaries() {
+size_t memory_map::scan_new_binaries(const string& force_include_path) {
   auto loaded = get_loaded_files();
+
+  string force_include_canonical;
+  if(_auto_scope && !force_include_path.empty()) {
+    force_include_canonical = canonicalize_path(force_include_path);
+  }
 
   size_t in_scope_count = 0;
   for(const auto& f : loaded) {
     const string& path = f.first;
     if(_processed_binaries.count(path) > 0) continue;
-    if(!in_scope(path, _binary_scope)) continue;
+
+    // auto_scope lets a library the caller explicitly dlopen'd bypass
+    // binary_scope entirely - the dlopen() call itself is the signal that
+    // this binary is wanted. Anything else newly mapped in this same
+    // snapshot (e.g. a transitive dependency pulled in alongside it) still
+    // has to match binary_scope normally.
+    bool forced = !force_include_canonical.empty() &&
+                  canonicalize_path(path) == force_include_canonical;
+    if(!forced && !in_scope(path, _binary_scope)) continue;
 
     // Mark as attempted before processing so a later rescan() never retries
     // a binary that failed or had no debug info, matching build()'s existing
@@ -375,7 +388,11 @@ size_t memory_map::scan_new_binaries() {
       } else {
         VERBOSE << "Unable to locate debug information for " << path;
       }
-    } catch(const system_error& e) {
+    } catch(const std::exception& e) {
+      // Catch broadly, not just system_error: a single library with
+      // malformed or unsupported debug info (more likely now that
+      // auto_scope/'%' pull in a wider, less-curated set of binaries) must
+      // not take down the whole profiled process.
       WARNING << "Processing file \"" << path << "\" failed: " << e.what();
     }
   }
@@ -384,10 +401,12 @@ size_t memory_map::scan_new_binaries() {
 
 void memory_map::build(const unordered_set<string>& binary_scope,
                        const unordered_set<string>& source_scope,
-                       bool allow_system_sources) {
+                       bool allow_system_sources,
+                       bool auto_scope) {
   _binary_scope = binary_scope;
   _source_scope = source_scope;
   _allow_system_sources = allow_system_sources;
+  _auto_scope = auto_scope;
 
   size_t in_scope_count = scan_new_binaries();
 
@@ -401,9 +420,9 @@ void memory_map::build(const unordered_set<string>& binary_scope,
   }
 }
 
-void memory_map::rescan() {
+void memory_map::rescan(const string& force_include_path) {
   _lock.lock();
-  size_t newly_processed = scan_new_binaries();
+  size_t newly_processed = scan_new_binaries(force_include_path);
   _lock.unlock();
 
   if(newly_processed > 0) {

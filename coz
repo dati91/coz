@@ -140,6 +140,9 @@ def _coz_run(args):
   else:
     env['COZ_SOURCE_SCOPE'] = '%'
 
+  if args.auto_scope:
+    env['COZ_AUTO_SCOPE'] = '1'
+
   env['COZ_PROGRESS_POINTS'] = '\t'.join(args.progress)
 
   env['COZ_OUTPUT'] = args.output
@@ -2300,6 +2303,13 @@ _run_parser.add_argument('--source-scope', '-s',
                          metavar='<file pattern>',
                          default=[], action='append',
                          help='Profile matching source files. Use \'%%\' as a wildcard. (default=%%)')
+
+_run_parser.add_argument('--auto-scope',
+                         action='store_true', default=False,
+                         help='Automatically profile any library the program dlopen()s or '
+                              'dlmopen()s later, even if it does not match --binary-scope. '
+                              'Lets dynamically loaded plugins get profiled with no scope '
+                              'configuration at all.')
 
 _run_parser.add_argument('--progress', '-p',
                          metavar='<source file>:<line number>',
