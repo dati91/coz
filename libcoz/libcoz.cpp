@@ -48,6 +48,25 @@ static bool end_to_end = false;
 bool initialized = false;
 static bool init_in_progress = false;
 
+/// The name ("file:line") of a pending --fixed-line target, if one was
+/// requested. Kept around (not just a local in init_coz()) so a later
+/// dlopen-triggered rescan can retry resolving it against memory_map once
+/// its library actually loads.
+static string fixed_line_name;
+
+/// Retry resolving a pending --fixed-line target. Safe to call repeatedly -
+/// a no-op once resolved, and a no-op if --fixed-line wasn't requested.
+static void try_resolve_fixed_line() {
+  if(fixed_line_name.empty()) return;
+  if(profiler::get_instance().has_fixed_line()) return;
+
+  shared_ptr<line> l = memory_map::get_instance().find_line(fixed_line_name);
+  if(l) {
+    profiler::get_instance().set_fixed_line(l.get());
+    VERBOSE << "Resolved fixed line \"" << fixed_line_name << "\"";
+  }
+}
+
 /**
  * Called by the application at progress points to check and apply delays.
  * This ensures worker threads check their delay debt at progress points,
@@ -209,7 +228,7 @@ void init_coz(void) {
   unordered_set<string> progress_points(progress_points_v.begin(), progress_points_v.end());
 
   end_to_end = getenv("COZ_END_TO_END");
-  string fixed_line_name = getenv_safe("COZ_FIXED_LINE", "");
+  fixed_line_name = getenv_safe("COZ_FIXED_LINE", "");
   int fixed_speedup;
   stringstream(getenv_safe("COZ_FIXED_SPEEDUP", "-1")) >> fixed_speedup;
 
@@ -259,7 +278,13 @@ void init_coz(void) {
   shared_ptr<line> fixed_line;
   if(fixed_line_name != "") {
     fixed_line = memory_map::get_instance().find_line(fixed_line_name);
-    REQUIRE(fixed_line) << "Fixed line \"" << fixed_line_name << "\" was not found.";
+    if(!fixed_line) {
+      // Not fatal: the named library may only get dlopen'd later. Every
+      // dlopen()/dlmopen() call retries this via try_resolve_fixed_line()
+      // once initialized == true, right after its rescan.
+      VERBOSE << "Fixed line \"" << fixed_line_name << "\" was not found yet; "
+              << "will retry once its library is dlopen'd";
+    }
   }
 
   // Create an end-to-end progress point and register it if running in
@@ -708,6 +733,7 @@ extern "C" {
     void* result = real::dlopen(filename, flags);
     if(initialized && result != nullptr) {
       memory_map::get_instance().rescan(resolved_dlopen_path(result));
+      try_resolve_fixed_line();
     }
     return result;
   }
@@ -717,6 +743,7 @@ extern "C" {
     void* result = real::dlmopen(nsid, filename, flags);
     if(initialized && result != nullptr) {
       memory_map::get_instance().rescan(resolved_dlopen_path(result));
+      try_resolve_fixed_line();
     }
     return result;
   }

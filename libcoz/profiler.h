@@ -72,6 +72,19 @@ public:
   /// Shut down the profiler
   void shutdown();
 
+  /// True once a --fixed-line target has resolved (immediately at startup,
+  /// or later via set_fixed_line() once the naming library gets dlopen'd).
+  inline bool has_fixed_line() const {
+    return _fixed_line.load() != nullptr;
+  }
+
+  /// Resolve a pending --fixed-line target after a dlopen-triggered rescan
+  /// finds it. No-op if a fixed line is already set - only ever transitions
+  /// from unset to set, once.
+  inline void set_fixed_line(line* l) {
+    _fixed_line.store(l);
+  }
+
   /// Get or create a progress point to measure throughput
   throughput_point* get_throughput_point(const std::string& name) {
     // Lock the map of throughput points
@@ -281,7 +294,13 @@ private:
   pthread_t _profiler_thread;     //< Handle for the profiler thread
   std::atomic<bool> _running;     //< Clear to signal the profiler thread to quit
   std::string _output_filename;   //< File for profiler output
-  line* _fixed_line;              //< The only line that should be sped up, if set
+
+  /// The only line that should be sped up, if set. Atomic because a
+  /// --fixed-line naming a not-yet-loaded library can't resolve until a
+  /// later dlopen-triggered rescan finds it - set_fixed_line() may run on
+  /// whatever application thread triggers that rescan, concurrently with
+  /// the profiler thread reading it in the experiment loop.
+  std::atomic<line*> _fixed_line{nullptr};
   int _fixed_delay_size = -1;     //< The only delay size that should be used, if set
   bool _json_output = true;       //< Output in JSON Lines format (default)
 

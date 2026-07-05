@@ -146,8 +146,11 @@ void profiler::startup(const string& outfile,
     _json_output = false;
   }
 
-  // If a non-empty fixed line was provided, set it
-  if(fixed_line) _fixed_line = fixed_line;
+  // If a non-empty fixed line was provided, set it. If it's still unresolved
+  // (the named library hasn't been dlopen'd yet), set_fixed_line() will be
+  // called later once a rescan finds it - until then the experiment loop
+  // just runs in normal (non-fixed) candidate-selection mode.
+  if(fixed_line) _fixed_line.store(fixed_line);
 
   // If the speedup amount is in bounds, set a fixed delay size
   if(fixed_speedup >= 0 && fixed_speedup <= 100)
@@ -247,8 +250,9 @@ void profiler::profiler_thread(spinlock& l) {
   while(_running) {
     // Select a line
     line* selected;
-    if(_fixed_line) {   // If this run has a fixed line, use it
-      selected = _fixed_line;
+    line* fixed_line = _fixed_line.load();
+    if(fixed_line) {   // If this run has a (possibly since-resolved) fixed line, use it
+      selected = fixed_line;
     } else {            // Otherwise, wait for the next line to be selected
       selected = _next_line.load();
       while(_running && selected == nullptr) {
