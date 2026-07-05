@@ -39,6 +39,14 @@ public:
   }
   
   void operator=(timer&& other) {
+    // Release this timer's own resource before taking the other one, or a
+    // slot reused across threads (see static_map::remove(), which frees a
+    // map slot without destroying its thread_state) leaks one kernel timer
+    // per reuse until timer_create() starts failing.
+    if(_initialized && (!other._initialized || _timer != other._timer)) {
+      REQUIRE(timer_delete(_timer) == 0) << "Failed to delete timer!";
+    }
+
     _timer = other._timer;
     _initialized = other._initialized;
     other._initialized = false;
