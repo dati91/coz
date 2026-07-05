@@ -16,6 +16,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -145,6 +146,12 @@ public:
     interval range;
     bool preferred;
   };
+
+  /// One resolved match for a --fixed-symbol lookup.
+  struct symbol_match {
+    std::string binary_path;
+    std::shared_ptr<line> resolved_line;
+  };
   inline const std::map<std::string, std::shared_ptr<file>>& files() const { return _files; }
   inline const std::map<interval, std::shared_ptr<line>>& ranges() const { return _ranges; }
   
@@ -179,6 +186,15 @@ public:
 
   std::shared_ptr<line> find_line(const std::string& name);
   std::shared_ptr<line> find_line(uintptr_t addr);
+
+  /// Find every in-scope subprogram whose (unqualified) DWARF name matches
+  /// symbol_name, optionally filtered to binaries matching binary_pattern
+  /// (same %-wildcard matching as --binary-scope; a pattern with no '%' is
+  /// treated as a suffix match for convenience, e.g. "libfoo.so" matches
+  /// any binary path ending in that name). Returns every match rather than
+  /// picking one, so the caller can detect and report ambiguity.
+  std::vector<symbol_match> find_symbol(const std::string& symbol_name,
+                                        const std::string& binary_pattern = std::string()) const;
 
   static memory_map& get_instance();
 
@@ -232,6 +248,11 @@ private:
   bool _auto_scope = false;
   std::unordered_set<std::string> _processed_binaries;
   spinlock _lock;
+
+  /// Symbol name -> every in-scope subprogram match found for it so far,
+  /// across every binary processed. Built incrementally in process_file(),
+  /// used by find_symbol() for --fixed-symbol lookups.
+  std::unordered_map<std::string, std::vector<symbol_match>> _symbols;
 };
 
 static std::ostream& operator<<(std::ostream& os, const interval& i) {

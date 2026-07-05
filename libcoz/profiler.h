@@ -72,27 +72,32 @@ public:
   /// Shut down the profiler
   void shutdown();
 
-  /// Cap on simultaneous --fixed-line targets (a handful of curated
-  /// candidates is the intended use; this isn't meant to scale to hundreds).
+  /// Cap on simultaneous --fixed-line/--fixed-symbol targets (a handful of
+  /// curated candidates is the intended use; this isn't meant to scale to
+  /// hundreds). Shared across both flags - they feed the same whitelist.
   static const size_t MaxFixedLines = 16;
 
-  /// Add a resolved --fixed-line target to the whitelist. Safe to call
-  /// repeatedly for the same line (e.g. once per rescan while retrying
-  /// resolution) - idempotent, only returns true the first time a given
-  /// line is actually newly added. Returns false if already present or if
-  /// the whitelist is full.
-  bool add_fixed_line(line* l) {
+  /// Outcome of add_fixed_line() - callers need to tell "full" apart from
+  /// "already present" so they can warn once when a target resolves but
+  /// can't actually get a slot, instead of silently dropping it.
+  enum class fixed_line_result { added, already_present, full };
+
+  /// Add a resolved --fixed-line/--fixed-symbol target to the whitelist.
+  /// Safe to call repeatedly for the same line (e.g. once per rescan while
+  /// retrying resolution) - idempotent, returns added only the first time a
+  /// given line is actually newly added.
+  fixed_line_result add_fixed_line(line* l) {
     for(auto& slot : _fixed_lines) {
       line* existing = slot.load();
-      if(existing == l) return false;
+      if(existing == l) return fixed_line_result::already_present;
       if(existing == nullptr) {
         line* expected = nullptr;
-        if(slot.compare_exchange_strong(expected, l)) return true;
-        if(expected == l) return false;
+        if(slot.compare_exchange_strong(expected, l)) return fixed_line_result::added;
+        if(expected == l) return fixed_line_result::already_present;
         // Lost the race to a *different* line claiming this slot - keep scanning.
       }
     }
-    return false;
+    return fixed_line_result::full;
   }
 
   /// Whether `l` should ever be nominated as the next experiment's

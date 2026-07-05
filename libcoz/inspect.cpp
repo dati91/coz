@@ -258,6 +258,11 @@ struct subprogram_range {
   std::string filename;
   size_t line;
   bool in_scope;
+  // Only set on the first range pushed for a given subprogram DIE (relevant
+  // when DW_AT::ranges reports several disjoint blocks, e.g. cold-path
+  // splitting at -O2+) - so a --fixed-symbol lookup registers one entry per
+  // function, not one per address range.
+  std::string symbol_name;
 };
 
 static void collect_subprogram_ranges(const dwarf::die& d,
@@ -272,20 +277,34 @@ static void collect_subprogram_ranges(const dwarf::die& d,
     if(d.tag == dwarf::DW_TAG::subprogram) {
       string decl_file;
       dwarf::value decl_file_val = find_attribute(d, dwarf::DW_AT::decl_file);
+      // GCC/DWARF5 often encodes this as a fixed-width data1/data2/data4/data8
+      // form, which this libelfin fork classifies as the generic `constant`
+      // type, not `uconstant` - as_uconstant() handles both forms identically,
+      // so accept either type tag rather than silently dropping decl_file.
       if(decl_file_val.valid() &&
-         decl_file_val.get_type() == dwarf::value::type::uconstant &&
+         (decl_file_val.get_type() == dwarf::value::type::uconstant ||
+          decl_file_val.get_type() == dwarf::value::type::constant) &&
          table.valid()) {
         decl_file = table.get_file(decl_file_val.as_uconstant())->path;
         decl_file = canonicalize_path(decl_file);
       }
-
       size_t decl_line = 0;
       dwarf::value decl_line_val = find_attribute(d, dwarf::DW_AT::decl_line);
       if(decl_line_val.valid()) {
-        if(decl_line_val.get_type() == dwarf::value::type::uconstant)
+        if(decl_line_val.get_type() == dwarf::value::type::uconstant ||
+           decl_line_val.get_type() == dwarf::value::type::constant)
           decl_line = decl_line_val.as_uconstant();
         else if(decl_line_val.get_type() == dwarf::value::type::sconstant)
           decl_line = decl_line_val.as_sconstant();
+      }
+
+      // Used for --fixed-symbol lookup. Usually the plain (unqualified) name -
+      // good enough for extern "C" functions; C++ overloads/methods would need
+      // linkage_name demangling to disambiguate, which isn't implemented yet.
+      string symbol_name;
+      dwarf::value name_val = find_attribute(d, dwarf::DW_AT::name);
+      if(name_val.valid() && name_val.get_type() == dwarf::value::type::string) {
+        symbol_name = name_val.as_string();
       }
 
       bool file_in_scope = decl_file.size() > 0 &&
@@ -294,8 +313,11 @@ static void collect_subprogram_ranges(const dwarf::die& d,
       if(file_in_scope && decl_line > 0) {
         dwarf::value ranges_val = find_attribute(d, dwarf::DW_AT::ranges);
         if(ranges_val.valid()) {
+          bool first = true;
           for(auto r : ranges_val.as_rangelist()) {
-            ranges.push_back(subprogram_range{r.low, r.high, decl_file, decl_line, true});
+            ranges.push_back(subprogram_range{r.low, r.high, decl_file, decl_line, true,
+                                              first ? symbol_name : string()});
+            first = false;
           }
         } else {
           dwarf::value low_pc_val = find_attribute(d, dwarf::DW_AT::low_pc);
@@ -306,20 +328,27 @@ static void collect_subprogram_ranges(const dwarf::die& d,
 
             if(low_pc_val.get_type() == dwarf::value::type::address)
               low_pc = low_pc_val.as_address();
-            else if(low_pc_val.get_type() == dwarf::value::type::uconstant)
+            else if(low_pc_val.get_type() == dwarf::value::type::uconstant ||
+                    low_pc_val.get_type() == dwarf::value::type::constant)
               low_pc = low_pc_val.as_uconstant();
             else if(low_pc_val.get_type() == dwarf::value::type::sconstant)
               low_pc = low_pc_val.as_sconstant();
 
+            // DWARF4+: when high_pc's form class is "address", it's an
+            // absolute address; otherwise (commonly a fixed-width data1/2/4/8
+            // form, classified here as `constant` rather than `uconstant`)
+            // it's an offset *from* low_pc, not an absolute value on its own.
             if(high_pc_val.get_type() == dwarf::value::type::address)
               high_pc = high_pc_val.as_address();
-            else if(high_pc_val.get_type() == dwarf::value::type::uconstant)
-              high_pc = high_pc_val.as_uconstant();
+            else if(high_pc_val.get_type() == dwarf::value::type::uconstant ||
+                    high_pc_val.get_type() == dwarf::value::type::constant)
+              high_pc = low_pc + high_pc_val.as_uconstant();
             else if(high_pc_val.get_type() == dwarf::value::type::sconstant)
-              high_pc = high_pc_val.as_sconstant();
+              high_pc = low_pc + high_pc_val.as_sconstant();
 
             if(high_pc > low_pc) {
-              ranges.push_back(subprogram_range{low_pc, high_pc, decl_file, decl_line, true});
+              ranges.push_back(subprogram_range{low_pc, high_pc, decl_file, decl_line, true,
+                                                symbol_name});
             }
           }
         }
@@ -601,6 +630,11 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
 
   vector<memory_map::queued_range> pending;
 
+  // Named subprograms collected across every CU in this file, resolved to
+  // candidate lines and registered into _symbols after _ranges is populated
+  // below (find_line(addr) needs this file's ranges to already be present).
+  vector<subprogram_range> named_subprograms;
+
   // Walk through the compilation units (source files) in the executable
   for(auto unit : d.compilation_units()) {
 
@@ -638,6 +672,10 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
                return a.low < b.low;
              return a.high < b.high;
            });
+
+      for(const auto& s : subprograms) {
+        if(!s.symbol_name.empty()) named_subprograms.push_back(s);
+      }
 
       // Walk through the line instructions in the DWARF line table
       for(auto& line_info : table) {
@@ -703,6 +741,52 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
     add_range(entry.filename, entry.line, entry.range);
   }
 
+  // Register --fixed-symbol targets now that _ranges has this file's data.
+  // One entry per (symbol name, binary) pair - collect_subprogram_ranges()
+  // already ensures at most one named subprogram_range per function even
+  // when DW_AT::ranges reports several disjoint address blocks.
+  for(const auto& s : named_subprograms) {
+    uintptr_t entry_addr = s.low + load_address;
+    uintptr_t end_addr = s.high + load_address;
+    shared_ptr<line> entry_line = find_line(entry_addr);
+    shared_ptr<line> resolved = entry_line;
+
+    // Prefer whichever line within the function has the most address-range
+    // entries, rather than just the entry/prologue line or the next line in
+    // program order. A function's first instruction's line is almost always
+    // its own declaration/signature line (prologue), and the statement right
+    // after it is often just a one-time initializer - neither accumulates
+    // real samples, since both execute once per call in a handful of cycles.
+    // A line the compiler emitted multiple address ranges for is a strong
+    // proxy for "this is a loop body the CPU actually revisits repeatedly",
+    // which is what makes a good --fixed-symbol target in practice.
+    if(entry_line) {
+      unordered_map<line*, size_t> counts;
+      unordered_map<line*, shared_ptr<line>> owners;
+      auto it = _ranges.find(entry_addr);
+      while(it != _ranges.end() && it->first.get_base() < end_addr) {
+        counts[it->second.get()]++;
+        owners[it->second.get()] = it->second;
+        ++it;
+      }
+      line* best = nullptr;
+      size_t best_count = 0;
+      for(const auto& entry : counts) {
+        if(entry.second > best_count) {
+          best_count = entry.second;
+          best = entry.first;
+        }
+      }
+      if(best && best_count > 1) {
+        resolved = owners[best];
+      }
+    }
+
+    if(resolved) {
+      _symbols[s.symbol_name].push_back(symbol_match{name, resolved});
+    }
+  }
+
   return true;
 }
 
@@ -738,6 +822,34 @@ shared_ptr<line> memory_map::find_line(uintptr_t addr) {
   } else {
     return shared_ptr<line>();
   }
+}
+
+vector<memory_map::symbol_match> memory_map::find_symbol(const string& symbol_name,
+                                                          const string& binary_pattern) const {
+  vector<symbol_match> result;
+
+  auto it = _symbols.find(symbol_name);
+  if(it == _symbols.end()) return result;
+
+  if(binary_pattern.empty()) {
+    result = it->second;
+    return result;
+  }
+
+  // A pattern with no wildcard is treated as a suffix match - "libfoo.so"
+  // should work without the caller needing to know/type the full path.
+  string pattern = binary_pattern;
+  if(pattern.find('%') == string::npos) {
+    pattern = "%" + pattern;
+  }
+  unordered_set<string> scope{pattern};
+
+  for(const auto& match : it->second) {
+    if(in_scope(match.binary_path, scope)) {
+      result.push_back(match);
+    }
+  }
+  return result;
 }
 
 memory_map& memory_map::get_instance() {

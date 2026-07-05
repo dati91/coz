@@ -156,6 +156,9 @@ def _coz_run(args):
   if len(args.fixed_line) > 0:
     env['COZ_FIXED_LINE'] = '\t'.join(args.fixed_line)
 
+  if len(args.fixed_symbol) > 0:
+    env['COZ_FIXED_SYMBOL'] = '\t'.join(args.fixed_symbol)
+
   if args.fixed_speedup != None:
     env['COZ_FIXED_SPEEDUP'] = str(args.fixed_speedup)
 
@@ -2342,6 +2345,19 @@ _run_parser.add_argument('--fixed-line',
                               'named this way are ever eligible for experiments, and '
                               'whichever gets sampled first each round is used, same '
                               'as normal candidate selection but restricted to this set.')
+
+_run_parser.add_argument('--fixed-symbol',
+                         metavar='[<binary>:]<function name>',
+                         default=[], action='append',
+                         help='Like --fixed-line, but names a function instead of a '
+                              'source line - resolves to whatever candidate line owns '
+                              'the function\'s entry address, gdb-breakpoint-style. '
+                              'If the name matches more than one in-scope function '
+                              '(common with identically-named functions across '
+                              'plugins), prefix it with the binary to disambiguate, '
+                              'e.g. "libfoo.so:run_block"; otherwise it\'s reported as '
+                              'ambiguous and left unresolved. Repeat and combine freely '
+                              'with --fixed-line - both feed the same eligible-line set.')
 
 _run_parser.add_argument('--fixed-speedup',
                          metavar='<speedup> (0-100)',

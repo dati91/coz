@@ -48,23 +48,115 @@ static bool end_to_end = false;
 bool initialized = false;
 static bool init_in_progress = false;
 
-/// The names ("file:line") of pending --fixed-line targets, if any were
-/// requested. Kept around (not just a local in init_coz()) so a later
-/// dlopen-triggered rescan can retry resolving the ones that aren't
-/// resolved yet against memory_map once their library actually loads.
-static vector<string> fixed_line_names;
+/// A pending --fixed-line target, tracked until it's either resolved (added
+/// to the profiler's whitelist) or permanently rejected (whitelist full) -
+/// `done` stops both the repeated lookup and repeated warning once either
+/// outcome is reached, since neither can change afterward (the whitelist
+/// only ever fills up, never frees a slot).
+struct fixed_line_target {
+  string name;
+  bool done = false;
+};
+static vector<fixed_line_target> fixed_line_targets;
+
+/// A pending --fixed-symbol target. `spec` is the raw value as given, split
+/// once into an optional binary-disambiguation prefix and the symbol name
+/// itself (see parse_fixed_symbol_spec()). Ambiguous matches are also
+/// terminal (`done`) - the user needs to add a binary prefix to disambiguate,
+/// retrying won't change a name that's ambiguous today into one that isn't.
+struct fixed_symbol_target {
+  string spec;
+  string binary_pattern;
+  string symbol_name;
+  bool done = false;
+};
+static vector<fixed_symbol_target> fixed_symbol_targets;
+
+/// Split a --fixed-symbol value on its last ':' into an optional binary
+/// disambiguation prefix ("libfoo.so:my_function") and the bare symbol name
+/// ("my_function", with no prefix). Symbol names never contain ':', so the
+/// last one found is always the separator if a prefix was given at all.
+static fixed_symbol_target parse_fixed_symbol_spec(const string& spec) {
+  fixed_symbol_target target;
+  target.spec = spec;
+  string::size_type colon_pos = spec.find_last_of(':');
+  if(colon_pos == string::npos) {
+    target.symbol_name = spec;
+  } else {
+    target.binary_pattern = spec.substr(0, colon_pos);
+    target.symbol_name = spec.substr(colon_pos + 1);
+  }
+  return target;
+}
+
+/// Warn (once) that a resolved --fixed-line/--fixed-symbol target couldn't
+/// get a whitelist slot, so hitting the cap is visible instead of silent.
+static void warn_if_full(const string& spec, profiler::fixed_line_result result) {
+  if(result == profiler::fixed_line_result::full) {
+    WARNING << "\"" << spec << "\" resolved, but the fixed-line/fixed-symbol "
+            << "whitelist is full (max " << profiler::MaxFixedLines << "); ignoring it";
+  }
+}
 
 /// Retry resolving every pending --fixed-line target. Safe to call
-/// repeatedly - add_fixed_line() is itself idempotent, so re-attempting an
-/// already-resolved name is a harmless no-op, and an empty
-/// fixed_line_names is a no-op too (nothing was requested).
+/// repeatedly - already-resolved or permanently-rejected targets are
+/// skipped, and an empty list is a no-op too (nothing was requested).
 static void try_resolve_fixed_lines() {
-  for(const string& name : fixed_line_names) {
-    shared_ptr<line> l = memory_map::get_instance().find_line(name);
-    if(l && profiler::get_instance().add_fixed_line(l.get())) {
-      VERBOSE << "Resolved fixed line \"" << name << "\"";
+  for(auto& target : fixed_line_targets) {
+    if(target.done) continue;
+
+    shared_ptr<line> l = memory_map::get_instance().find_line(target.name);
+    if(!l) continue; // library may not be dlopen'd yet - keep retrying
+
+    auto result = profiler::get_instance().add_fixed_line(l.get());
+    if(result == profiler::fixed_line_result::added) {
+      VERBOSE << "Resolved fixed line \"" << target.name << "\"";
+    } else {
+      warn_if_full(target.name, result);
     }
+    target.done = true;
   }
+}
+
+/// Retry resolving every pending --fixed-symbol target. Same idempotency
+/// story as try_resolve_fixed_lines(), plus ambiguity handling: a bare
+/// symbol name matching more than one in-scope subprogram is reported once
+/// (listing every candidate) and left unresolved rather than guessing.
+static void try_resolve_fixed_symbols() {
+  for(auto& target : fixed_symbol_targets) {
+    if(target.done) continue;
+
+    auto matches = memory_map::get_instance().find_symbol(target.symbol_name, target.binary_pattern);
+    if(matches.empty()) continue; // not loaded yet - keep retrying
+
+    if(matches.size() > 1) {
+      stringstream candidates;
+      for(const auto& m : matches) {
+        candidates << "\n  " << m.binary_path;
+      }
+      WARNING << "Fixed symbol \"" << target.spec << "\" is ambiguous ("
+              << matches.size() << " matches) - disambiguate with "
+              << "\"<binary>:" << target.symbol_name << "\":" << candidates.str();
+      target.done = true;
+      continue;
+    }
+
+    auto result = profiler::get_instance().add_fixed_line(matches[0].resolved_line.get());
+    if(result == profiler::fixed_line_result::added) {
+      VERBOSE << "Resolved fixed symbol \"" << target.spec << "\" in " << matches[0].binary_path;
+    } else {
+      warn_if_full(target.spec, result);
+    }
+    target.done = true;
+  }
+}
+
+/// Retry every pending --fixed-line and --fixed-symbol target. Called once
+/// initially (for targets already loaded at bootstrap) and again after
+/// every dlopen()/dlmopen()-triggered rescan.
+static void try_resolve_fixed_targets() {
+  try_resolve_fixed_lines();
+  try_resolve_fixed_symbols();
 }
 
 /**
@@ -228,7 +320,19 @@ void init_coz(void) {
   unordered_set<string> progress_points(progress_points_v.begin(), progress_points_v.end());
 
   end_to_end = getenv("COZ_END_TO_END");
-  fixed_line_names = split(getenv_safe("COZ_FIXED_LINE"), '\t');
+
+  fixed_line_targets.clear();
+  for(const string& name : split(getenv_safe("COZ_FIXED_LINE"), '\t')) {
+    fixed_line_target target;
+    target.name = name;
+    fixed_line_targets.push_back(target);
+  }
+
+  fixed_symbol_targets.clear();
+  for(const string& spec : split(getenv_safe("COZ_FIXED_SYMBOL"), '\t')) {
+    fixed_symbol_targets.push_back(parse_fixed_symbol_spec(spec));
+  }
+
   int fixed_speedup;
   stringstream(getenv_safe("COZ_FIXED_SPEEDUP", "-1")) >> fixed_speedup;
 
@@ -275,18 +379,11 @@ void init_coz(void) {
     FATAL << "Sampling-based progress points are temporarily unsupported";
   }
 
-  for(const string& name : fixed_line_names) {
-    shared_ptr<line> fixed_line = memory_map::get_instance().find_line(name);
-    if(fixed_line) {
-      profiler::get_instance().add_fixed_line(fixed_line.get());
-    } else {
-      // Not fatal: the named library may only get dlopen'd later. Every
-      // dlopen()/dlmopen() call retries this via try_resolve_fixed_lines()
-      // once initialized == true, right after its rescan.
-      VERBOSE << "Fixed line \"" << name << "\" was not found yet; "
-              << "will retry once its library is dlopen'd";
-    }
-  }
+  // Not fatal if any target isn't found yet: its library may only get
+  // dlopen'd later. Every dlopen()/dlmopen() call retries this via
+  // try_resolve_fixed_targets() once initialized == true, right after its
+  // rescan (see below).
+  try_resolve_fixed_targets();
 
   // Create an end-to-end progress point and register it if running in
   // end-to-end mode
@@ -733,7 +830,7 @@ extern "C" {
     void* result = real::dlopen(filename, flags);
     if(initialized && result != nullptr) {
       memory_map::get_instance().rescan(resolved_dlopen_path(result));
-      try_resolve_fixed_lines();
+      try_resolve_fixed_targets();
     }
     return result;
   }
@@ -743,7 +840,7 @@ extern "C" {
     void* result = real::dlmopen(nsid, filename, flags);
     if(initialized && result != nullptr) {
       memory_map::get_instance().rescan(resolved_dlopen_path(result));
-      try_resolve_fixed_lines();
+      try_resolve_fixed_targets();
     }
     return result;
   }
