@@ -48,22 +48,22 @@ static bool end_to_end = false;
 bool initialized = false;
 static bool init_in_progress = false;
 
-/// The name ("file:line") of a pending --fixed-line target, if one was
+/// The names ("file:line") of pending --fixed-line targets, if any were
 /// requested. Kept around (not just a local in init_coz()) so a later
-/// dlopen-triggered rescan can retry resolving it against memory_map once
-/// its library actually loads.
-static string fixed_line_name;
+/// dlopen-triggered rescan can retry resolving the ones that aren't
+/// resolved yet against memory_map once their library actually loads.
+static vector<string> fixed_line_names;
 
-/// Retry resolving a pending --fixed-line target. Safe to call repeatedly -
-/// a no-op once resolved, and a no-op if --fixed-line wasn't requested.
-static void try_resolve_fixed_line() {
-  if(fixed_line_name.empty()) return;
-  if(profiler::get_instance().has_fixed_line()) return;
-
-  shared_ptr<line> l = memory_map::get_instance().find_line(fixed_line_name);
-  if(l) {
-    profiler::get_instance().set_fixed_line(l.get());
-    VERBOSE << "Resolved fixed line \"" << fixed_line_name << "\"";
+/// Retry resolving every pending --fixed-line target. Safe to call
+/// repeatedly - add_fixed_line() is itself idempotent, so re-attempting an
+/// already-resolved name is a harmless no-op, and an empty
+/// fixed_line_names is a no-op too (nothing was requested).
+static void try_resolve_fixed_lines() {
+  for(const string& name : fixed_line_names) {
+    shared_ptr<line> l = memory_map::get_instance().find_line(name);
+    if(l && profiler::get_instance().add_fixed_line(l.get())) {
+      VERBOSE << "Resolved fixed line \"" << name << "\"";
+    }
   }
 }
 
@@ -228,7 +228,7 @@ void init_coz(void) {
   unordered_set<string> progress_points(progress_points_v.begin(), progress_points_v.end());
 
   end_to_end = getenv("COZ_END_TO_END");
-  fixed_line_name = getenv_safe("COZ_FIXED_LINE", "");
+  fixed_line_names = split(getenv_safe("COZ_FIXED_LINE"), '\t');
   int fixed_speedup;
   stringstream(getenv_safe("COZ_FIXED_SPEEDUP", "-1")) >> fixed_speedup;
 
@@ -275,14 +275,15 @@ void init_coz(void) {
     FATAL << "Sampling-based progress points are temporarily unsupported";
   }
 
-  shared_ptr<line> fixed_line;
-  if(fixed_line_name != "") {
-    fixed_line = memory_map::get_instance().find_line(fixed_line_name);
-    if(!fixed_line) {
+  for(const string& name : fixed_line_names) {
+    shared_ptr<line> fixed_line = memory_map::get_instance().find_line(name);
+    if(fixed_line) {
+      profiler::get_instance().add_fixed_line(fixed_line.get());
+    } else {
       // Not fatal: the named library may only get dlopen'd later. Every
-      // dlopen()/dlmopen() call retries this via try_resolve_fixed_line()
+      // dlopen()/dlmopen() call retries this via try_resolve_fixed_lines()
       // once initialized == true, right after its rescan.
-      VERBOSE << "Fixed line \"" << fixed_line_name << "\" was not found yet; "
+      VERBOSE << "Fixed line \"" << name << "\" was not found yet; "
               << "will retry once its library is dlopen'd";
     }
   }
@@ -295,7 +296,6 @@ void init_coz(void) {
 
   // Start the profiler
   profiler::get_instance().startup(output_file,
-                                   fixed_line.get(),
                                    fixed_speedup,
                                    end_to_end);
 
@@ -733,7 +733,7 @@ extern "C" {
     void* result = real::dlopen(filename, flags);
     if(initialized && result != nullptr) {
       memory_map::get_instance().rescan(resolved_dlopen_path(result));
-      try_resolve_fixed_line();
+      try_resolve_fixed_lines();
     }
     return result;
   }
@@ -743,7 +743,7 @@ extern "C" {
     void* result = real::dlmopen(nsid, filename, flags);
     if(initialized && result != nullptr) {
       memory_map::get_instance().rescan(resolved_dlopen_path(result));
-      try_resolve_fixed_line();
+      try_resolve_fixed_lines();
     }
     return result;
   }

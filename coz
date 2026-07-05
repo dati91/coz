@@ -153,8 +153,8 @@ def _coz_run(args):
   if args.end_to_end:
     env['COZ_END_TO_END'] = '1'
 
-  if args.fixed_line:
-    env['COZ_FIXED_LINE'] = args.fixed_line
+  if len(args.fixed_line) > 0:
+    env['COZ_FIXED_LINE'] = '\t'.join(args.fixed_line)
 
   if args.fixed_speedup != None:
     env['COZ_FIXED_SPEEDUP'] = str(args.fixed_speedup)
@@ -2335,8 +2335,13 @@ _run_parser.add_argument('--end-to-end',
                          help='Run a single performance experiment per-execution')
 
 _run_parser.add_argument('--fixed-line',
-                         metavar='<source file>:<line number>', default=None,
-                         help='Evaluate optimizations of a specific source line')
+                         metavar='<source file>:<line number>',
+                         default=[], action='append',
+                         help='Evaluate optimizations of a specific source line. '
+                              'Repeat to test several lines in one run - only lines '
+                              'named this way are ever eligible for experiments, and '
+                              'whichever gets sampled first each round is used, same '
+                              'as normal candidate selection but restricted to this set.')
 
 _run_parser.add_argument('--fixed-speedup',
                          metavar='<speedup> (0-100)',

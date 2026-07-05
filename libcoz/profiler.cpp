@@ -105,7 +105,6 @@ static bool is_coz_header(const line* l) {
  * Start the profiler
  */
 void profiler::startup(const string& outfile,
-                       line* fixed_line,
                        int fixed_speedup,
                        bool end_to_end) {
   // Set up the sampling signal handler.
@@ -146,11 +145,9 @@ void profiler::startup(const string& outfile,
     _json_output = false;
   }
 
-  // If a non-empty fixed line was provided, set it. If it's still unresolved
-  // (the named library hasn't been dlopen'd yet), set_fixed_line() will be
-  // called later once a rescan finds it - until then the experiment loop
-  // just runs in normal (non-fixed) candidate-selection mode.
-  if(fixed_line) _fixed_line.store(fixed_line);
+  // --fixed-line targets are added via add_fixed_line() by the caller
+  // (libcoz.cpp), both here at startup for names that already resolve and
+  // later, repeatedly, as dlopen-triggered rescans resolve the rest.
 
   // If the speedup amount is in bounds, set a fixed delay size
   if(fixed_speedup >= 0 && fixed_speedup <= 100)
@@ -248,26 +245,24 @@ void profiler::profiler_thread(spinlock& l) {
 
   // Main experiment loop
   while(_running) {
-    // Select a line
-    line* selected;
-    line* fixed_line = _fixed_line.load();
-    if(fixed_line) {   // If this run has a (possibly since-resolved) fixed line, use it
-      selected = fixed_line;
-    } else {            // Otherwise, wait for the next line to be selected
-      selected = _next_line.load();
-      while(_running && selected == nullptr) {
-        wait(SamplePeriod * SampleBatchSize);
+    // Wait for the next line to be selected. If --fixed-line targets are
+    // configured, both nomination sites (process_samples() on Linux,
+    // process_all_samples() on macOS) only ever nominate a line from that
+    // whitelist via line_is_selectable() - otherwise any in-scope line can
+    // be nominated, same as always.
+    line* selected = _next_line.load();
+    while(_running && selected == nullptr) {
+      wait(SamplePeriod * SampleBatchSize);
 #ifdef __APPLE__
-        // On macOS, must process samples here to set _next_line
-        process_all_samples();
-        apply_pending_delays();
+      // On macOS, must process samples here to set _next_line
+      process_all_samples();
+      apply_pending_delays();
 #endif
-        selected = _next_line.load();
-      }
-
-      // If we're no longer running, exit the experiment loop
-      if(!_running) break;
+      selected = _next_line.load();
     }
+
+    // If we're no longer running, exit the experiment loop
+    if(!_running) break;
 
     // Store the globally-visible selected line
     _selected_line.store(selected);
@@ -739,7 +734,8 @@ void profiler::process_samples(thread_state* state) {
           state->local_delay.fetch_add(_delay_size.load());
 
       } else if(sampled_line.first != nullptr && _next_line.load() == nullptr
-                && !is_coz_header(sampled_line.first)) {
+                && !is_coz_header(sampled_line.first)
+                && line_is_selectable(sampled_line.first)) {
         _next_line.store(sampled_line.first);
       }
     }
@@ -803,7 +799,8 @@ void profiler::process_all_samples() {
             needs_signal = true;
           }
         } else if(!experiment_active && sampled_line.first != nullptr && _next_line.load() == nullptr
-                  && !is_coz_header(sampled_line.first)) {
+                  && !is_coz_header(sampled_line.first)
+                  && line_is_selectable(sampled_line.first)) {
           // When not in an experiment, select this line for the next experiment
           _next_line.store(sampled_line.first);
         }

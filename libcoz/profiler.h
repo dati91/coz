@@ -8,6 +8,7 @@
 #if !defined(CAUSAL_RUNTIME_PROFILER_H)
 #define CAUSAL_RUNTIME_PROFILER_H
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <fstream>
@@ -65,24 +66,50 @@ class profiler {
 public:
   /// Start the profiler
   void startup(const std::string& outfile,
-               line* fixed_line,
                int fixed_speedup,
                bool end_to_end);
 
   /// Shut down the profiler
   void shutdown();
 
-  /// True once a --fixed-line target has resolved (immediately at startup,
-  /// or later via set_fixed_line() once the naming library gets dlopen'd).
-  inline bool has_fixed_line() const {
-    return _fixed_line.load() != nullptr;
+  /// Cap on simultaneous --fixed-line targets (a handful of curated
+  /// candidates is the intended use; this isn't meant to scale to hundreds).
+  static const size_t MaxFixedLines = 16;
+
+  /// Add a resolved --fixed-line target to the whitelist. Safe to call
+  /// repeatedly for the same line (e.g. once per rescan while retrying
+  /// resolution) - idempotent, only returns true the first time a given
+  /// line is actually newly added. Returns false if already present or if
+  /// the whitelist is full.
+  bool add_fixed_line(line* l) {
+    for(auto& slot : _fixed_lines) {
+      line* existing = slot.load();
+      if(existing == l) return false;
+      if(existing == nullptr) {
+        line* expected = nullptr;
+        if(slot.compare_exchange_strong(expected, l)) return true;
+        if(expected == l) return false;
+        // Lost the race to a *different* line claiming this slot - keep scanning.
+      }
+    }
+    return false;
   }
 
-  /// Resolve a pending --fixed-line target after a dlopen-triggered rescan
-  /// finds it. No-op if a fixed line is already set - only ever transitions
-  /// from unset to set, once.
-  inline void set_fixed_line(line* l) {
-    _fixed_line.store(l);
+  /// Whether `l` should ever be nominated as the next experiment's
+  /// candidate: true unconditionally if no --fixed-line targets are
+  /// configured (normal automatic mode), otherwise only if `l` is in the
+  /// whitelist. This is the one predicate both nomination sites
+  /// (process_samples() and process_all_samples()) need to agree on.
+  inline bool line_is_selectable(line* l) const {
+    bool any_configured = false;
+    for(const auto& slot : _fixed_lines) {
+      line* v = slot.load();
+      if(v != nullptr) {
+        any_configured = true;
+        if(v == l) return true;
+      }
+    }
+    return !any_configured;
   }
 
   /// Get or create a progress point to measure throughput
@@ -295,12 +322,14 @@ private:
   std::atomic<bool> _running;     //< Clear to signal the profiler thread to quit
   std::string _output_filename;   //< File for profiler output
 
-  /// The only line that should be sped up, if set. Atomic because a
-  /// --fixed-line naming a not-yet-loaded library can't resolve until a
-  /// later dlopen-triggered rescan finds it - set_fixed_line() may run on
-  /// whatever application thread triggers that rescan, concurrently with
-  /// the profiler thread reading it in the experiment loop.
-  std::atomic<line*> _fixed_line{nullptr};
+  /// Lines eligible for candidate selection, if any --fixed-line targets
+  /// were requested (all slots stay nullptr otherwise, meaning "no
+  /// restriction"). Atomic per-slot because a --fixed-line naming a
+  /// not-yet-loaded library can't resolve until a later dlopen-triggered
+  /// rescan finds it - add_fixed_line() may run on whatever application
+  /// thread triggers that rescan, concurrently with the profiler thread and
+  /// sampling signal handler reading it via line_is_selectable().
+  std::array<std::atomic<line*>, MaxFixedLines> _fixed_lines;
   int _fixed_delay_size = -1;     //< The only delay size that should be used, if set
   bool _json_output = true;       //< Output in JSON Lines format (default)
 
