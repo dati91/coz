@@ -61,13 +61,22 @@ static vector<fixed_line_target> fixed_line_targets;
 
 /// A pending --fixed-symbol target. `spec` is the raw value as given, split
 /// once into an optional binary-disambiguation prefix and the symbol name
-/// itself (see parse_fixed_symbol_spec()). Ambiguous matches are also
-/// terminal (`done`) - the user needs to add a binary prefix to disambiguate,
-/// retrying won't change a name that's ambiguous today into one that isn't.
+/// itself (see parse_fixed_symbol_spec()).
+///
+/// Exact (non-wildcard) names are terminal once resolved either way:
+/// ambiguous matches need the user to add a binary prefix and retry with a
+/// new invocation, not something that changes on its own, and a unique
+/// match is a one-time resolution. Wildcard names (containing '%') are
+/// different on purpose: matching several symbols at once is the intent of
+/// writing a wildcard, not an error to reject, and new matches can keep
+/// appearing as more libraries get dlopen'd - so a wildcard target is never
+/// marked done and keeps rescanning for additional matches for the life of
+/// the process (idempotent: already-added lines are cheap no-ops).
 struct fixed_symbol_target {
   string spec;
   string binary_pattern;
   string symbol_name;
+  bool is_wildcard = false;
   bool done = false;
 };
 static vector<fixed_symbol_target> fixed_symbol_targets;
@@ -103,6 +112,7 @@ static fixed_symbol_target parse_fixed_symbol_spec(const string& spec) {
     target.binary_pattern = spec.substr(0, sep);
     target.symbol_name = spec.substr(sep + 1);
   }
+  target.is_wildcard = target.symbol_name.find('%') != string::npos;
   return target;
 }
 
@@ -136,15 +146,33 @@ static void try_resolve_fixed_lines() {
 }
 
 /// Retry resolving every pending --fixed-symbol target. Same idempotency
-/// story as try_resolve_fixed_lines(), plus ambiguity handling: a bare
-/// symbol name matching more than one in-scope subprogram is reported once
-/// (listing every candidate) and left unresolved rather than guessing.
+/// story as try_resolve_fixed_lines() for exact names, plus ambiguity
+/// handling: a bare exact name matching more than one in-scope subprogram
+/// is reported once (listing every candidate) and left unresolved rather
+/// than guessing. Wildcard names (see fixed_symbol_target) are handled
+/// separately below: every match gets added, and the target is never
+/// marked done, since new matches may still appear later.
 static void try_resolve_fixed_symbols() {
   for(auto& target : fixed_symbol_targets) {
     if(target.done) continue;
 
     auto matches = memory_map::get_instance().find_symbol(target.symbol_name, target.binary_pattern);
-    if(matches.empty()) continue; // not loaded yet - keep retrying
+    VERBOSE << "Fixed symbol target \"" << target.spec << "\" (name=\"" << target.symbol_name
+            << "\" binary_pattern=\"" << target.binary_pattern << "\" wildcard="
+            << (target.is_wildcard ? "yes" : "no") << "): " << matches.size() << " match(es) so far";
+    if(matches.empty()) continue; // not loaded yet (or a wildcard with nothing new) - keep retrying
+
+    if(target.is_wildcard) {
+      for(const auto& m : matches) {
+        auto result = profiler::get_instance().add_fixed_line(m.resolved_line.get());
+        if(result == profiler::fixed_line_result::added) {
+          VERBOSE << "Resolved fixed symbol \"" << target.spec << "\" to a match in " << m.binary_path;
+        } else {
+          warn_if_full(target.spec, result);
+        }
+      }
+      continue; // never done - more matches can appear as more libraries load
+    }
 
     if(matches.size() > 1) {
       stringstream candidates;

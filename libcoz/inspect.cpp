@@ -170,21 +170,29 @@ bool wildcard_match(string::const_iterator subject,
                     string::const_iterator pattern,
                     string::const_iterator pattern_end) {
 
-  if((pattern == pattern_end) != (subject == subject_end)) {
-    // If one but not both of the iterators have finished, match failed
-    return false;
-  } else if(pattern == pattern_end && subject == subject_end) {
-    // If both iterators have finished, match succeeded
-    return true;
+  if(pattern == pattern_end) {
+    // No pattern left: matches only if subject is also fully consumed.
+    return subject == subject_end;
 
   } else if(*pattern == '%') {
-    // Try possible matches of the wildcard, starting with the longest possible match
-    for(auto match_end = subject_end; match_end >= subject; match_end--) {
+    // Try possible matches of the wildcard, starting with the longest
+    // possible match. Checked before looking at whether subject is already
+    // exhausted (unlike the other two branches below) because a trailing
+    // '%' must be able to match zero remaining characters - e.g. matching
+    // "%side_product%" against exactly "side_product", with nothing left
+    // over for the trailing '%' to consume.
+    for(auto match_end = subject_end; ; match_end--) {
       if(wildcard_match(match_end, subject_end, pattern+1, pattern_end)) {
         return true;
       }
+      if(match_end == subject) break;
     }
     // No matches found. Abort
+    return false;
+
+  } else if(subject == subject_end) {
+    // Pattern still has non-wildcard content left, but subject has none:
+    // never a match.
     return false;
 
   } else {
@@ -879,11 +887,28 @@ vector<memory_map::symbol_match> memory_map::find_symbol(const string& symbol_na
                                                           const string& binary_pattern) const {
   vector<symbol_match> result;
 
-  auto it = _symbols.find(symbol_name);
-  if(it == _symbols.end()) return result;
+  // A '%' in the name means "match every registered symbol name against
+  // this pattern" (same wildcard convention as --binary-scope/--source-
+  // scope), rather than the exact-match fast path below. This is a linear
+  // scan over every distinct name ever registered - fine here, since it
+  // only runs once per rescan (a dlopen call), never on the sampling path.
+  vector<const vector<symbol_match>*> matched_name_groups;
+  if(symbol_name.find('%') != string::npos) {
+    for(const auto& entry : _symbols) {
+      if(wildcard_match(entry.first, symbol_name)) {
+        matched_name_groups.push_back(&entry.second);
+      }
+    }
+  } else {
+    auto it = _symbols.find(symbol_name);
+    if(it == _symbols.end()) return result;
+    matched_name_groups.push_back(&it->second);
+  }
 
   if(binary_pattern.empty()) {
-    result = it->second;
+    for(const auto* group : matched_name_groups) {
+      result.insert(result.end(), group->begin(), group->end());
+    }
     return result;
   }
 
@@ -895,9 +920,11 @@ vector<memory_map::symbol_match> memory_map::find_symbol(const string& symbol_na
   }
   unordered_set<string> scope{pattern};
 
-  for(const auto& match : it->second) {
-    if(in_scope(match.binary_path, scope)) {
-      result.push_back(match);
+  for(const auto* group : matched_name_groups) {
+    for(const auto& match : *group) {
+      if(in_scope(match.binary_path, scope)) {
+        result.push_back(match);
+      }
     }
   }
   return result;

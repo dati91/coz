@@ -2352,12 +2352,18 @@ _run_parser.add_argument('--fixed-symbol',
                          help='Like --fixed-line, but names a function instead of a '
                               'source line - resolves to whatever candidate line owns '
                               'the function\'s entry address, gdb-breakpoint-style. '
-                              'If the name matches more than one in-scope function '
-                              '(common with identically-named functions across '
-                              'plugins), prefix it with the binary to disambiguate, '
-                              'e.g. "libfoo.so:run_block"; otherwise it\'s reported as '
-                              'ambiguous and left unresolved. Repeat and combine freely '
-                              'with --fixed-line - both feed the same eligible-line set.')
+                              'Accepts qualified C++ names ("Class::method") and a '
+                              '\'%%\' wildcard (same convention as --binary-scope/'
+                              '--source-scope), e.g. "%%side_product%%" matches every '
+                              'function whose name contains "side_product". A wildcard '
+                              'adds every match to the eligible set (that\'s the point '
+                              'of writing one) and keeps matching new ones as more '
+                              'libraries get dlopen\'d; an exact (non-wildcard) name '
+                              'matching more than one in-scope function is reported as '
+                              'ambiguous instead - prefix it with the binary to '
+                              'disambiguate, e.g. "libfoo.so:run_block". Repeat and '
+                              'combine freely with --fixed-line - both feed the same '
+                              'eligible-line set.')
 
 _run_parser.add_argument('--fixed-speedup',
                          metavar='<speedup> (0-100)',
