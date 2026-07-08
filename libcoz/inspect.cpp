@@ -832,6 +832,18 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
       if(best && best_count > 1) {
         resolved = owners[best];
       }
+      // Kept permanently (not a throwaway debug print) so --fixed-symbol's
+      // line-selection heuristic is inspectable via COZ_VERBOSE=1 instead of
+      // needing print statements added back in every time it's in question.
+      VERBOSE << "Symbol \"" << s.symbol_name << "\" [0x" << std::hex << entry_addr
+              << ", 0x" << end_addr << std::dec << "): entry line was "
+              << (entry_line ? entry_line->get_line() : 0) << ", picked line "
+              << (resolved ? resolved->get_line() : 0) << " with " << best_count
+              << " address-range entries, out of " << counts.size()
+              << " distinct candidate line(s):";
+      for(const auto& entry : counts) {
+        VERBOSE << "  line " << entry.first->get_line() << ": " << entry.second << " entries";
+      }
     }
 
     if(resolved) {
