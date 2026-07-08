@@ -72,19 +72,36 @@ struct fixed_symbol_target {
 };
 static vector<fixed_symbol_target> fixed_symbol_targets;
 
-/// Split a --fixed-symbol value on its last ':' into an optional binary
-/// disambiguation prefix ("libfoo.so:my_function") and the bare symbol name
-/// ("my_function", with no prefix). Symbol names never contain ':', so the
-/// last one found is always the separator if a prefix was given at all.
+/// Split a --fixed-symbol value into an optional binary disambiguation
+/// prefix ("libfoo.so:my_function") and the symbol name itself
+/// ("my_function", with no prefix). The symbol name may itself be a
+/// qualified C++ name containing "::" (e.g. "Square::side_product"), which
+/// must not be mistaken for the binary:symbol separator - so this looks for
+/// a lone, undoubled ':' (not part of a "::" pair) rather than just the
+/// last ':' in the string. "libfoo.so:Square::side_product" (both a binary
+/// prefix and a qualified name) resolves correctly: the first lone ':' is
+/// the separator, and the "::" a few characters later is left alone.
 static fixed_symbol_target parse_fixed_symbol_spec(const string& spec) {
   fixed_symbol_target target;
   target.spec = spec;
-  string::size_type colon_pos = spec.find_last_of(':');
-  if(colon_pos == string::npos) {
+
+  string::size_type sep = string::npos;
+  for(string::size_type i = 0; i < spec.size(); i++) {
+    if(spec[i] != ':') continue;
+    bool prev_colon = i > 0 && spec[i - 1] == ':';
+    bool next_colon = i + 1 < spec.size() && spec[i + 1] == ':';
+    if(!prev_colon && !next_colon) {
+      sep = i;
+      break;
+    }
+    if(next_colon) i++; // skip the second colon of a "::" pair
+  }
+
+  if(sep == string::npos) {
     target.symbol_name = spec;
   } else {
-    target.binary_pattern = spec.substr(0, colon_pos);
-    target.symbol_name = spec.substr(colon_pos + 1);
+    target.binary_pattern = spec.substr(0, sep);
+    target.symbol_name = spec.substr(sep + 1);
   }
   return target;
 }

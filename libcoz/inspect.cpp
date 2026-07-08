@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <algorithm>
+#include <cxxabi.h>
 #include <dwarf++.hh>
 
 #include "util.h"
@@ -263,7 +264,31 @@ struct subprogram_range {
   // splitting at -O2+) - so a --fixed-symbol lookup registers one entry per
   // function, not one per address range.
   std::string symbol_name;
+  // The demangled "Class::method" (or "func<T>") form, when DW_AT::linkage_name
+  // is present and differs from symbol_name - lets --fixed-symbol disambiguate
+  // overloads/overrides/template instantiations that all share the same plain
+  // name. Empty when there's nothing more specific than symbol_name to offer
+  // (e.g. extern "C" functions, which usually have no mangled linkage name).
+  std::string qualified_name;
 };
+
+// Demangled C++ names look like "Namespace::Class::method(int, float) const".
+// Cut at the function's own parameter list (the first '(' at paren/template
+// nesting depth 0) so --fixed-symbol users can type "Class::method" instead
+// of the full signature. Left as symbol_name-equivalent if demangling fails
+// or the mangled form doesn't look like a function signature at all.
+static string extract_qualified_name(const string& demangled) {
+  int depth = 0;
+  for(size_t i = 0; i < demangled.size(); i++) {
+    char c = demangled[i];
+    if(c == '(' && depth == 0) {
+      return demangled.substr(0, i);
+    }
+    if(c == '<' || c == '(') depth++;
+    else if(c == '>' || c == ')') depth--;
+  }
+  return demangled;
+}
 
 static void collect_subprogram_ranges(const dwarf::die& d,
                                       const dwarf::line_table& table,
@@ -298,13 +323,31 @@ static void collect_subprogram_ranges(const dwarf::die& d,
           decl_line = decl_line_val.as_sconstant();
       }
 
-      // Used for --fixed-symbol lookup. Usually the plain (unqualified) name -
-      // good enough for extern "C" functions; C++ overloads/methods would need
-      // linkage_name demangling to disambiguate, which isn't implemented yet.
+      // Used for --fixed-symbol lookup: the plain (unqualified) name - fine
+      // on its own for extern "C" functions, but overloaded/overridden C++
+      // methods and template instantiations all share the same one, so
+      // they're ambiguous under this key alone (qualified_name below
+      // disambiguates those).
       string symbol_name;
       dwarf::value name_val = find_attribute(d, dwarf::DW_AT::name);
       if(name_val.valid() && name_val.get_type() == dwarf::value::type::string) {
         symbol_name = name_val.as_string();
+      }
+
+      // The demangled "Class::method"/"func<T>" form, when linkage_name
+      // (the mangled symbol) is present and demangles to something more
+      // specific than symbol_name.
+      string qualified_name;
+      dwarf::value linkage_name_val = find_attribute(d, dwarf::DW_AT::linkage_name);
+      if(linkage_name_val.valid() && linkage_name_val.get_type() == dwarf::value::type::string) {
+        string mangled = linkage_name_val.as_string();
+        int status = 0;
+        char* demangled = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+        if(status == 0 && demangled != nullptr) {
+          string extracted = extract_qualified_name(string(demangled));
+          if(extracted != symbol_name) qualified_name = extracted;
+        }
+        free(demangled);
       }
 
       bool file_in_scope = decl_file.size() > 0 &&
@@ -316,7 +359,8 @@ static void collect_subprogram_ranges(const dwarf::die& d,
           bool first = true;
           for(auto r : ranges_val.as_rangelist()) {
             ranges.push_back(subprogram_range{r.low, r.high, decl_file, decl_line, true,
-                                              first ? symbol_name : string()});
+                                              first ? symbol_name : string(),
+                                              first ? qualified_name : string()});
             first = false;
           }
         } else {
@@ -348,7 +392,7 @@ static void collect_subprogram_ranges(const dwarf::die& d,
 
             if(high_pc > low_pc) {
               ranges.push_back(subprogram_range{low_pc, high_pc, decl_file, decl_line, true,
-                                                symbol_name});
+                                                symbol_name, qualified_name});
             }
           }
         }
@@ -784,6 +828,13 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
 
     if(resolved) {
       _symbols[s.symbol_name].push_back(symbol_match{name, resolved});
+      // Also register under the demangled "Class::method"/"func<T>" form
+      // (when one exists and actually differs from symbol_name), so
+      // --fixed-symbol can disambiguate overloads/overrides/template
+      // instantiations that all share the same plain name.
+      if(!s.qualified_name.empty()) {
+        _symbols[s.qualified_name].push_back(symbol_match{name, resolved});
+      }
     }
   }
 
