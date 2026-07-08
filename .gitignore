@@ -70,3 +70,6 @@ matrix_file_*.txt
 profile.coz
 profile.jsonl
 profile-results/
+
+sim_test/*.so
+sim_test/driver
