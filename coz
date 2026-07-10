@@ -212,6 +212,15 @@ def parse_profile(profile_path, include_raw=False):
   samples = {}
   raw_experiments = [] if include_raw else None
 
+  # An experiment whose candidate line was never actually sampled during its
+  # window (selected_samples == 0) never had a delay applied, regardless of
+  # the nominal speedup - it measured unmodified baseline behavior, not a
+  # real test of that speedup level. These are excluded from `data` (the
+  # aggregated buckets that drive the regression) but still counted here and
+  # kept in raw_experiments, so the exclusion is visible rather than silent.
+  skipped_zero_sample = 0
+  skipped_by_line = {}
+
   with open(profile_path, 'r') as f:
     # Detect format from first line
     first_line = f.readline().strip()
@@ -253,15 +262,19 @@ def parse_profile(profile_path, include_raw=False):
             pp_name = record.get('name', '')
             delta = int(record.get('delta', 0))
 
-            if selected not in data:
-              data[selected] = {}
-            if pp_name not in data[selected]:
-              data[selected][pp_name] = {}
-            if speedup not in data[selected][pp_name]:
-              data[selected][pp_name][speedup] = {'delta': 0, 'duration': 0}
+            if experiment['selected_samples'] == 0:
+              skipped_zero_sample += 1
+              skipped_by_line[selected] = skipped_by_line.get(selected, 0) + 1
+            else:
+              if selected not in data:
+                data[selected] = {}
+              if pp_name not in data[selected]:
+                data[selected][pp_name] = {}
+              if speedup not in data[selected][pp_name]:
+                data[selected][pp_name][speedup] = {'delta': 0, 'duration': 0}
 
-            data[selected][pp_name][speedup]['delta'] += delta
-            data[selected][pp_name][speedup]['duration'] += duration
+              data[selected][pp_name][speedup]['delta'] += delta
+              data[selected][pp_name][speedup]['duration'] += duration
 
             if include_raw:
               raw_experiments.append({
@@ -310,15 +323,19 @@ def parse_profile(profile_path, include_raw=False):
             pp_name = fields.get('name', '')
             delta = int(fields.get('delta', 0))
 
-            if selected not in data:
-              data[selected] = {}
-            if pp_name not in data[selected]:
-              data[selected][pp_name] = {}
-            if speedup not in data[selected][pp_name]:
-              data[selected][pp_name][speedup] = {'delta': 0, 'duration': 0}
+            if experiment['selected_samples'] == 0:
+              skipped_zero_sample += 1
+              skipped_by_line[selected] = skipped_by_line.get(selected, 0) + 1
+            else:
+              if selected not in data:
+                data[selected] = {}
+              if pp_name not in data[selected]:
+                data[selected][pp_name] = {}
+              if speedup not in data[selected][pp_name]:
+                data[selected][pp_name][speedup] = {'delta': 0, 'duration': 0}
 
-            data[selected][pp_name][speedup]['delta'] += delta
-            data[selected][pp_name][speedup]['duration'] += duration
+              data[selected][pp_name][speedup]['delta'] += delta
+              data[selected][pp_name][speedup]['duration'] += duration
 
             if include_raw:
               raw_experiments.append({
@@ -338,7 +355,7 @@ def parse_profile(profile_path, include_raw=False):
             count = int(fields.get('count', 0))
             samples[loc] = samples.get(loc, 0) + count
 
-  return data, experiment_count, runtime, samples, raw_experiments
+  return data, experiment_count, runtime, samples, raw_experiments, skipped_zero_sample, skipped_by_line
 
 def calculate_speedups(data, min_points=1, min_delta=5):
   """Calculate program speedup for each source line.
@@ -417,11 +434,24 @@ def calculate_speedups(data, min_points=1, min_delta=5):
   results.sort(key=lambda x: x['max_speedup'], reverse=True)
   return results
 
-def print_text_summary(profile_path, results, experiment_count, runtime, samples):
+def print_text_summary(profile_path, results, experiment_count, runtime, samples,
+                       skipped_zero_sample=0, skipped_by_line=None):
   """Print summary table of profiling results."""
   print(f"Profile: {profile_path}")
   runtime_sec = runtime / 1e9 if runtime > 0 else 0
   print(f"Experiments: {experiment_count} | Runtime: {runtime_sec:.1f}s")
+
+  if skipped_zero_sample > 0:
+    print(f"Warning: {skipped_zero_sample} experiment(s) wanted to test a speedup but never "
+          f"got the chance - the candidate line was never actually sampled during those "
+          f"windows, so no delay was applied. Excluded from the results below (they carry no "
+          f"information about that speedup level's effect); would otherwise have silently "
+          f"pulled some buckets toward \"no measurable effect\".")
+    if skipped_by_line:
+      worst = sorted(skipped_by_line.items(), key=lambda kv: kv[1], reverse=True)[:5]
+      for line, count in worst:
+        print(f"  {count}x  {line}")
+
   print()
 
   if not results:
@@ -520,7 +550,8 @@ def print_scatter_plot(result):
   print("              Line Speedup")
 
 def _output_json(output_path, profile_path, data, results, experiment_count,
-                 runtime, samples, raw_experiments):
+                 runtime, samples, raw_experiments, skipped_zero_sample=0,
+                 skipped_by_line=None):
   """Output detailed experiment data as JSON for analysis."""
   import json
 
@@ -532,6 +563,12 @@ def _output_json(output_path, profile_path, data, results, experiment_count,
 
     # Sample counts by location
     'samples': samples,
+
+    # Experiments excluded from `aggregated`/`results` because their
+    # candidate line was never actually sampled (selected_samples == 0), so
+    # no delay was ever applied - see raw_experiments for the full list.
+    'skipped_zero_sample_experiments': skipped_zero_sample,
+    'skipped_zero_sample_by_line': skipped_by_line or {},
 
     # Aggregated data by selected line -> progress point -> speedup
     'aggregated': {},
@@ -606,12 +643,14 @@ def _coz_plot_text(args):
     sys.stderr.write('error: no profile found. Specify with -i or run from directory with profile.coz or profile.jsonl\n')
     sys.exit(1)
 
-  data, experiment_count, runtime, samples, raw_experiments = parse_profile(profile_path, include_raw=True)
+  data, experiment_count, runtime, samples, raw_experiments, skipped_zero_sample, skipped_by_line = \
+    parse_profile(profile_path, include_raw=True)
   results = calculate_speedups(data)
 
   # Only print text output if --text is specified or --json is not specified
   if args.text or not args.json:
-    print_text_summary(profile_path, results, experiment_count, runtime, samples)
+    print_text_summary(profile_path, results, experiment_count, runtime, samples,
+                       skipped_zero_sample, skipped_by_line)
 
     if args.verbose and results:
       print()
@@ -624,7 +663,7 @@ def _coz_plot_text(args):
   # Output JSON if requested
   if args.json:
     _output_json(args.json, profile_path, data, results, experiment_count,
-                 runtime, samples, raw_experiments)
+                 runtime, samples, raw_experiments, skipped_zero_sample, skipped_by_line)
 
 def _find_viewer_directory():
   """Find the viewer directory relative to this script's location."""

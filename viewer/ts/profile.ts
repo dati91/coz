@@ -37,6 +37,10 @@ interface Experiment {
   selected: string;
   speedup: number;
   duration: number;
+  // Absent in profiles written before this field existed - treated as
+  // "unknown" (not excluded), not as zero. Only an explicit 0 means the
+  // candidate line was never sampled during this experiment's window.
+  selected_samples?: number;
 }
 
 interface ThroughputPoint {
@@ -916,6 +920,12 @@ function parseLine(s: string): Line {
         case 'speedup':
           value = parseFloat(value);
           break;
+        case 'selected-samples':
+          // The legacy writer uses a hyphen; normalize to match the JSON
+          // format's key so downstream code only checks one spelling.
+          key = 'selected_samples';
+          value = parseInt(value, 10);
+          break;
       }
 
       obj[key] = value;
@@ -1004,6 +1014,14 @@ class Profile {
     let lines = profile_text.split('\n');
     let experiment: Experiment = null;
 
+    // An experiment whose candidate line was never actually sampled during
+    // its window (selected_samples === 0) never had a delay applied,
+    // regardless of the nominal speedup - it measured unmodified baseline
+    // behavior, not a real test of that speedup level. Counted here and
+    // surfaced via display_warning below rather than silently included,
+    // where it would pull that bucket's aggregate toward "no effect".
+    let skipped_zero_sample = 0;
+
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].length == 0) continue;
       let entry = parseLine(lines[i]);
@@ -1025,19 +1043,34 @@ class Profile {
         }
       } else if (entry.type === 'throughput-point' || entry.type === 'throughput_point' || entry.type === 'progress-point') {
         if (experiment !== null) {
-          this.addThroughputMeasurement(experiment, entry);
+          if (experiment.selected_samples === 0) {
+            skipped_zero_sample++;
+          } else {
+            this.addThroughputMeasurement(experiment, entry);
+          }
         }
       } else if (entry.type === 'latency-point' || entry.type === 'latency_point') {
         if (experiment !== null) {
-          this.addLatencyMeasurement(experiment, entry);
+          if (experiment.selected_samples === 0) {
+            skipped_zero_sample++;
+          } else {
+            this.addLatencyMeasurement(experiment, entry);
+          }
         }
       } else {
         display_warning('Invalid Profile', 'The profile you loaded contains an invalid line: <pre>' + lines[i] + '</pre>');
       }
     }
-    
+
     if (experiment == null) {
       display_warning('Empty Profile', 'The profile you loaded does not contain result from any performance experiments. Make sure you specified a progress point, built your program with debug information, and ran your program on an input that took at least a few seconds.')
+    } else if (skipped_zero_sample > 0) {
+      display_warning('Some Experiments Excluded',
+        `${skipped_zero_sample} experiment(s) wanted to test a speedup but never got the ` +
+        `chance - the candidate line was never actually sampled during those windows, so no ` +
+        `delay was applied. Excluded from the plot (they carry no information about that ` +
+        `speedup level's effect); otherwise they would have silently pulled some points ` +
+        `toward "no measurable effect".`);
     }
   }
 
