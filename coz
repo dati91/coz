@@ -476,6 +476,45 @@ def print_text_summary(profile_path, results, experiment_count, runtime, samples
     r2_str = f"{r['r_squared']:>5.2f}" if r.get('r_squared') is not None else '  N/A'
     print(f"{r['line']:<{max_line_len}} | {slope_str} | {r2_str} | {sign}{speedup_pct:>9.1f}% | {r['num_points']:>5}")
 
+def print_samples_summary(samples, top_n=20):
+  """Print a hotspot summary: which locations were actually sampled the
+  most, i.e. where the program spent its time. This is raw sample-count
+  data - independent of, and answering a different question from, the
+  causal-impact regression table above (a line can dominate the sample
+  count and still have near-zero measured speedup potential if it's not on
+  the critical path, and vice versa)."""
+  if not samples:
+    return
+
+  total = sum(samples.values())
+  print()
+  print("=" * 70)
+  print("SAMPLE COUNTS (where the program actually spent time)")
+  print("=" * 70)
+  print(f"Total samples: {total}")
+  print()
+
+  sorted_samples = sorted(samples.items(), key=lambda kv: kv[1], reverse=True)
+  shown = sorted_samples[:top_n]
+
+  max_loc_len = max(len(loc) for loc, _ in shown)
+  max_loc_len = max(max_loc_len, 8)  # "Location" header
+
+  header = f"{'Location':<{max_loc_len}} | {'Count':>7} | {'%':>6}"
+  print(header)
+  print('-' * max_loc_len + '-+---------+-------')
+
+  for loc, count in shown:
+    pct = 100.0 * count / total if total > 0 else 0
+    print(f"{loc:<{max_loc_len}} | {count:>7} | {pct:>5.1f}%")
+
+  remaining = sorted_samples[top_n:]
+  if remaining:
+    remaining_count = sum(c for _, c in remaining)
+    remaining_pct = 100.0 * remaining_count / total if total > 0 else 0
+    print(f"... and {len(remaining)} more location(s), {remaining_count} samples ({remaining_pct:.1f}%) - full "
+          f"breakdown available via --json")
+
 def print_scatter_plot(result):
   """Print an ASCII scatter plot for a single result."""
   line = result['line']
@@ -651,6 +690,7 @@ def _coz_plot_text(args):
   if args.text or not args.json:
     print_text_summary(profile_path, results, experiment_count, runtime, samples,
                        skipped_zero_sample, skipped_by_line)
+    print_samples_summary(samples)
 
     if args.verbose and results:
       print()
